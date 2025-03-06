@@ -1,0 +1,60 @@
+import networkx as nx
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import euclidean_distances
+
+def construct_graph_from_features(features_csv, output_gml, visualization_dir):
+    # Load features from CSV
+    features = pd.read_csv(features_csv)
+
+    # Create a graph
+    G = nx.Graph()
+
+    # Add nodes with features as attributes
+    for i, row in features.iterrows():
+        G.add_node(i, **row.to_dict())
+
+    # Add edges based on similarity (e.g., Euclidean distance between feature vectors)
+    feature_matrix = features[["area", "perimeter", "eccentricity", "mean_intensity", "contrast"]].values
+    distances = euclidean_distances(feature_matrix)
+
+    threshold = 0.5 * distances.max()  # Define a threshold for edge creation
+    for i in range(len(features)):
+        for j in range(i + 1, len(features)):
+            if distances[i, j] <= threshold:
+                G.add_edge(i, j, weight=1 / (distances[i, j] + 1e-7))  # Add edges with weights
+
+    # Save graph to GML file
+    nx.write_gml(G, output_gml)
+    print(f"Graph saved to {output_gml}")
+
+    # Visualize and save the graph
+    os.makedirs(visualization_dir, exist_ok=True)
+    plt.figure(figsize=(10, 10))
+    pos = nx.spring_layout(G)  # Use a spring layout for visualization
+    nx.draw(G, pos, with_labels=False, node_size=20, node_color='blue', edge_color='gray')
+    plt.title("Graph Visualization")
+    plt.savefig(os.path.join(visualization_dir, "graph_visualization.png"), dpi=300)
+    plt.close()
+
+# Main function to process all classes
+def process_graphs_for_classes(features_dir, output_graph_dir, visualization_dir):
+    classes = ["augmented_normal", "augmented_cin1", "augmented_cin2", "cin3", "carcinoma"]
+
+    for cls in classes:
+        print(f"Processing class: {cls}")
+
+        class_features_csv = os.path.join(features_dir, f"{cls}_features.csv")
+        class_output_gml = os.path.join(output_graph_dir, f"{cls}_graph.gml")
+        class_visualization_dir = os.path.join(visualization_dir, cls)
+
+        construct_graph_from_features(class_features_csv, class_output_gml, class_visualization_dir)
+
+# Directories
+features_dir =  # Directory containing feature CSVs
+output_graph_dir =   # Directory to save graph files
+visualization_dir =   # Directory to save graph visualizations
+
+# Run the graph construction pipeline
+process_graphs_for_classes(features_dir, output_graph_dir, visualization_dir)
