@@ -1,0 +1,237 @@
+import os
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import Input, Conv2D, UpSampling2D, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import tensorflow as tf
+
+# Constants
+IMG_HEIGHT, IMG_WIDTH = 128, 128
+BATCH_SIZE = 8
+EPOCHS = 100
+LEARNING_RATE = 1e-4
+
+
+# Enable mixed precision training
+from tensorflow.keras.mixed_precision import set_global_policy
+set_global_policy('mixed_float16')
+
+
+# Metrics
+def dice_coef(y_true, y_pred):
+    y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = tf.keras.backend.flatten(tf.cast(y_pred, tf.float32))
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    return (2. * intersection + 1e-7) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + 1e-7)
+
+def iou_coef(y_true, y_pred):
+    y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = tf.keras.backend.flatten(tf.cast(y_pred, tf.float32))
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    union = tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) - intersection
+    return intersection / (union + 1e-7)
+
+def precision(y_true, y_pred):
+    y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = tf.keras.backend.flatten(tf.cast(y_pred, tf.float32))
+    true_positive = tf.keras.backend.sum(y_true_f * y_pred_f)
+    predicted_positive = tf.keras.backend.sum(y_pred_f)
+    return true_positive / (predicted_positive + 1e-7)
+
+def recall(y_true, y_pred):
+    y_true_f = tf.keras.backend.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = tf.keras.backend.flatten(tf.cast(y_pred, tf.float32))
+    true_positive = tf.keras.backend.sum(y_true_f * y_pred_f)
+    actual_positive = tf.keras.backend.sum(y_true_f)
+    return true_positive / (actual_positive + 1e-7)
+
+# Load Data Function
+def load_data(image_dir, mask_dir, img_size=(128, 128)):
+    images, masks = [], []
+    image_files = sorted(os.listdir(image_dir))
+    mask_files = sorted(os.listdir(mask_dir))
+
+    for img_file, mask_file in zip(image_files, mask_files):
+        img_path = os.path.join(image_dir, img_file)
+        mask_path = os.path.join(mask_dir, mask_file)
+
+        # Read and preprocess images
+        img = cv2.imread(img_path) / 255.0
+        img = cv2.resize(img, img_size)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE) / 255.0
+        mask = cv2.resize(mask, img_size)
+        mask = np.expand_dims(mask, axis=-1)
+
+        images.append(img.astype(np.float32))
+        masks.append(mask.astype(np.float32))
+
+    return np.array(images), np.array(masks)
+
+# DeepLabV3+ Architecture
+def deeplabv3plus(input_shape):
+    base_model = tf.keras.applications.ResNet50(weights='imagenet', include_top=False, input_tensor=Input(input_shape))
+    layer_names = ["conv4_block6_2_relu", "conv5_block3_out"]
+
+    # Extract features
+    features = [base_model.get_layer(name).output for name in layer_names]
+    x = features[1]
+
+    # Atrous Spatial Pyramid Pooling (ASPP)
+    aspp = []
+    for rate in [1, 6, 12, 18]:
+        aspp_layer = Conv2D(256, (3, 3), dilation_rate=rate, padding="same", activation="relu")(x)
+        aspp.append(aspp_layer)
+    x = Concatenate()(aspp)
+
+    # Resize the ASPP output to match the spatial dimensions of features[0]
+    x = tf.keras.layers.Resizing(features[0].shape[1], features[0].shape[2])(x)
+
+    # Concatenate with the skip connection
+    x = Concatenate()([x, features[0]])
+
+    # Final Upsampling
+    x = UpSampling2D(size=(4, 4), interpolation="bilinear")(x)
+    x = UpSampling2D(size=(4, 4), interpolation="bilinear")(x)  # Additional upsampling to match 128x128
+    outputs = Conv2D(1, (1, 1), activation="sigmoid")(x)
+
+    model = Model(inputs=base_model.input, outputs=outputs)
+    return model
+
+
+def train_and_evaluate(image_dir, mask_dir, output_dir, skip_if_exists=True):
+    # Check if the output directory has valid outputs
+    if skip_if_exists:
+        if os.path.exists(output_dir):
+            has_outputs = any(
+                os.path.exists(os.path.join(output_dir, folder, "original.png"))
+                for folder in os.listdir(output_dir)
+                if os.path.isdir(os.path.join(output_dir, folder))
+            )
+            if has_outputs:
+                print(f"Skipping class as results already exist in: {output_dir}")
+                return
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Data
+    X, Y = load_data(image_dir, mask_dir)
+    print(f"Loaded {len(X)} images and masks from {image_dir} and {mask_dir}")
+
+    X_train, X_temp, Y_train, Y_temp = train_test_split(X, Y, test_size=0.2, random_state=42)
+    X_val, X_test, Y_val, Y_test = train_test_split(X_temp, Y_temp, test_size=0.5, random_state=42)
+
+    # Build and Compile Model
+    model = deeplabv3plus((IMG_HEIGHT, IMG_WIDTH, 3))
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE),
+                  loss="binary_crossentropy",
+                  metrics=["accuracy", dice_coef, iou_coef, precision, recall])
+
+    # Callbacks
+    early_stopping = EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5)
+
+    # Train Model
+    print(f"Training model for class: {os.path.basename(image_dir)}")
+    history = model.fit(
+        X_train, Y_train,
+        validation_data=(X_val, Y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[early_stopping, reduce_lr]
+    )
+
+    # Plot Training and Validation Metrics
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.legend()
+    plt.title('Accuracy')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.legend()
+    plt.title('Loss')
+    plt.show()
+
+    # Predict for the entire dataset (all images)
+    print(f"Generating predictions for all images in class: {os.path.basename(image_dir)}")
+    Y_pred = model.predict(X)
+    Y_pred_thresholded = (Y_pred > 0.5).astype(np.uint8)
+
+    # Save predictions for all images
+    for i in range(len(X)):
+        image_folder = os.path.join(output_dir, f"image_{i+1:03d}")
+        os.makedirs(image_folder, exist_ok=True)
+
+        # Save original image
+        img = (X[i] * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(image_folder, "original.png"), img)
+
+        # Save ground truth mask
+        gt_mask = (Y[i].squeeze() * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(image_folder, "gt_mask.png"), gt_mask)
+
+        # Save predicted mask
+        pred_mask = (Y_pred_thresholded[i].squeeze() * 255).astype(np.uint8)
+        cv2.imwrite(os.path.join(image_folder, "predicted_mask.png"), pred_mask)
+
+        # Save overlay
+        overlay = cv2.addWeighted(img, 0.7, cv2.applyColorMap(pred_mask, cv2.COLORMAP_JET), 0.3, 0)
+        cv2.imwrite(os.path.join(image_folder, "overlay.png"), overlay)
+
+    # Print Metrics for Test Set
+    metrics = {
+        "Dice Coefficient": np.mean([dice_coef(Y_test[i], Y_pred_thresholded[i]).numpy() for i in range(len(Y_test))]),
+        "IoU": np.mean([iou_coef(Y_test[i], Y_pred_thresholded[i]).numpy() for i in range(len(Y_test))]),
+        "Precision": np.mean([precision(Y_test[i], Y_pred_thresholded[i]).numpy() for i in range(len(Y_test))]),
+        "Recall": np.mean([recall(Y_test[i], Y_pred_thresholded[i]).numpy() for i in range(len(Y_test))]),
+    }
+    for metric, value in metrics.items():
+        print(f"{metric}: {value:.4f}")
+
+    # Visualize 50 samples from the test set
+    for i in range(min(50, len(X_test))):
+        plt.figure(figsize=(12, 4))
+        plt.subplot(1, 4, 1)
+        plt.title("Original Image")
+        plt.imshow(X_test[i])
+        plt.subplot(1, 4, 2)
+        plt.title("Ground Truth")
+        plt.imshow(Y_test[i].squeeze(), cmap="gray")
+        plt.subplot(1, 4, 3)
+        plt.title("Predicted Mask")
+        plt.imshow(Y_pred_thresholded[i].squeeze(), cmap="gray")
+        plt.subplot(1, 4, 4)
+        plt.title("Overlay")
+        overlay = cv2.addWeighted(
+            (X_test[i] * 255).astype(np.uint8),
+            0.7,
+            cv2.applyColorMap((Y_pred_thresholded[i].squeeze() * 255).astype(np.uint8), cv2.COLORMAP_JET),
+            0.3,
+            0
+        )
+        plt.imshow(overlay)
+        plt.show()
+
+# Classwise Training and Saving
+classes = ["augmented_cin1", "augmented_cin2", "cin3", "carcinoma"]
+base_path = "" #your file path
+output_base_path = ""#your file path
+
+for cls in classes:
+    print(f"Processing class: {cls}")
+
+    # Paths for the class
+    image_dir = os.path.join(base_path, cls, "image")
+    mask_dir = os.path.join(base_path, cls, "mask")
+    output_dir = os.path.join(output_base_path, cls)
+
+    # Train and save results
+    train_and_evaluate(image_dir, mask_dir, output_dir)
