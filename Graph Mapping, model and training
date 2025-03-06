@@ -1,0 +1,317 @@
+import os
+import random
+import torch
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch.nn import Linear
+from torch.nn.functional import relu, cross_entropy
+from sklearn.metrics import classification_report, roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
+import networkx as nx
+from sklearn.model_selection import ParameterGrid, KFold
+from torch_geometric.utils import to_networkx
+
+# GNN Model Definition
+class GNN(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(GNN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.fc = Linear(hidden_dim, output_dim)
+
+    def forward(self, data):
+        x, edge_index, edge_weight, batch = data.x, data.edge_index, data.edge_attr, data.batch
+        x = relu(self.conv1(x, edge_index, edge_weight=edge_weight))
+        x = relu(self.conv2(x, edge_index, edge_weight=edge_weight))
+        x = global_mean_pool(x, batch)  # Pooling
+        x = self.fc(x)
+        return x
+
+
+# Generate Graph-to-Mask-to-Image Mapping
+def generate_graph_to_mask_and_image_mapping(graph_dir, mask_dir, image_dir, graph_class_name, mask_class_name, image_class_name):
+    graph_files = [os.path.join(graph_dir, graph_class_name, f) for f in os.listdir(os.path.join(graph_dir, graph_class_name)) if f.endswith(".gml")]
+    mask_files = [os.path.join(mask_dir, mask_class_name, f) for f in os.listdir(os.path.join(mask_dir, mask_class_name)) if f.endswith(".png")]
+    image_files = [os.path.join(image_dir, image_class_name, f) for f in os.listdir(os.path.join(image_dir, image_class_name)) if f.endswith(".png")]
+
+    if len(graph_files) == 0 or len(mask_files) == 0 or len(image_files) == 0:
+        return {}
+
+    if len(graph_files) > len(mask_files):
+        mask_files = mask_files * (len(graph_files) // len(mask_files)) + mask_files[:len(graph_files) % len(mask_files)]
+    if len(graph_files) > len(image_files):
+        image_files = image_files * (len(graph_files) // len(image_files)) + image_files[:len(graph_files) % len(image_files)]
+
+    random.shuffle(graph_files)
+    random.shuffle(mask_files)
+    random.shuffle(image_files)
+
+    return {graph: (mask, image) for graph, mask, image in zip(graph_files, mask_files, image_files)}
+
+
+# Load Graphs with Associated Masks and Images
+def load_graphs(graph_dir, class_mapping, graph_to_mask_image_maps, max_graphs_per_class=500):
+    data_list = []
+    for cls, label in class_mapping.items():
+        if cls not in graph_to_mask_image_maps:
+            continue
+
+        mappings = graph_to_mask_image_maps[cls]
+        graph_files = list(mappings.keys())[:max_graphs_per_class]
+
+        for graph_file in graph_files:
+            mask_file, image_file = mappings[graph_file]
+            try:
+                G = nx.read_gml(graph_file)
+                node_mapping = {node: idx for idx, node in enumerate(G.nodes())}
+                G = nx.relabel_nodes(G, node_mapping)
+
+                x = torch.tensor([list(G.nodes[node].values()) for node in G.nodes()], dtype=torch.float)
+                edge_index = torch.tensor(list(G.edges()), dtype=torch.long).t().contiguous()
+                edge_weights = [G[u][v].get("weight", 1.0) for u, v in G.edges()]
+                edge_attr = torch.tensor(edge_weights, dtype=torch.float).view(-1, 1)
+                y = torch.tensor([label], dtype=torch.long)
+
+                data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+                data.graph_path = graph_file
+                data.mask_path = mask_file
+                data.image_path = image_file
+                data_list.append(data)
+            except Exception as e:
+                print(f"Failed to process {graph_file}: {e}")
+    return data_list
+
+
+# Train Model
+def train_model(model, train_loader, optimizer, epochs=100, patience=5):
+    model.train()
+    best_loss = float("inf")
+    patience_counter = 0
+    for epoch in range(epochs):
+        train_loss = 0
+        for data in train_loader:
+            optimizer.zero_grad()
+            out = model(data)
+            loss = cross_entropy(out, data.y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        train_loss /= len(train_loader)
+        if train_loss < best_loss:
+            best_loss = train_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        if patience_counter >= patience:
+            break
+def visualize_predictions(data, y_pred, class_mapping, save_dir="predictions"):
+    os.makedirs(save_dir, exist_ok=True)
+    for i, img_path in enumerate(data.image_path):
+        try:
+            # Load original image and mask
+            original_img = Image.open(img_path)
+            mask_img = Image.open(data.mask_path[i])
+
+            # Convert graph to a NetworkX object for visualization
+            graph = to_networkx(data, node_attrs=["x"], edge_attrs=["edge_attr"])
+            pos = nx.spring_layout(graph)  # Layout for graph visualization
+
+            # Create figure for visualization
+            fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+
+            # Original Image
+            axs[0].imshow(original_img)
+            axs[0].set_title("Original Image")
+            axs[0].axis("off")
+
+            # Mask
+            axs[1].imshow(mask_img, cmap="gray")
+            axs[1].set_title("Mask")
+            axs[1].axis("off")
+
+            # Graph
+            nx.draw(graph, pos, with_labels=False, node_size=50, ax=axs[2])
+            axs[2].set_title("Graph")
+
+            # Prediction
+            predicted_class = list(class_mapping.keys())[y_pred[i]]
+            axs[3].imshow(original_img)
+            axs[3].set_title(f"Prediction: {predicted_class}")
+            axs[3].axis("off")
+
+            # Save visualization
+            save_path = os.path.join(save_dir, f"prediction_{i}.png")
+            plt.savefig(save_path)
+            plt.close(fig)
+
+            print(f"Saved prediction visualization to {save_path}")
+
+        except Exception as e:
+            print(f"Error visualizing prediction for {img_path}: {e}")
+
+# Evaluate Model
+def evaluate_model_with_visualization(model, loader, class_mapping, save_dir="predictions", stage="Test"):
+    model.eval()
+    y_true, y_pred = [], []
+    for data in loader:
+        with torch.no_grad():
+            out = model(data)
+            y_true.extend(data.y.cpu().numpy())
+            y_pred.extend(out.argmax(dim=1).cpu().numpy())
+
+            # Visualize predictions
+            visualize_predictions(data, y_pred, class_mapping, save_dir=save_dir)
+
+    # Evaluate performance
+    unique_labels = sorted(list(set(y_true + y_pred)))
+    present_class_mapping = {
+        class_name: label
+        for class_name, label in class_mapping.items()
+        if label in unique_labels
+    }
+    target_names = list(present_class_mapping.keys())
+
+    report = classification_report(y_true, y_pred, target_names=target_names, output_dict=True, zero_division=1)
+    print(f"{stage} Classification Report:\n{classification_report(y_true, y_pred, target_names=target_names, zero_division=1)}")
+    cm = confusion_matrix(y_true, y_pred, labels=unique_labels)
+    ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=target_names).plot(cmap="Blues")
+    plt.title(f"{stage} Confusion Matrix")
+    plt.show()
+
+    return report
+
+# Perform Grid Search
+def grid_search(train_loader, val_loader, class_mapping, param_grid, patience):
+    best_model, best_params, best_score = None, None, 0
+    for params in ParameterGrid(param_grid):
+        model = GNN(input_dim=next(iter(train_loader)).x.shape[1], hidden_dim=params["hidden_dim"], output_dim=len(class_mapping))
+        optimizer = torch.optim.Adam(model.parameters(), lr=params["learning_rate"])
+        train_model(model, train_loader, optimizer, epochs=params["epochs"], patience=patience)
+        report = evaluate_model(model, val_loader, class_mapping, stage="Validation")
+        current_score = report["macro avg"]["f1-score"]
+        if current_score > best_score:
+            best_model, best_params, best_score = model, params, current_score
+    return best_params, best_model
+
+
+# K-Fold Cross-Validation
+def train_gnn_kfold_with_visualization(data_list, class_mapping, k_folds=5, param_grid=None, patience=5):
+    results_before, results_after = [], []
+    kf = KFold(n_splits=k_folds, shuffle=True)
+    for fold, (train_idx, test_idx) in enumerate(kf.split(data_list)):
+        train_data = [data_list[i] for i in train_idx]
+        test_data = [data_list[i] for i in test_idx]
+        train_loader = DataLoader(train_data, batch_size=8, shuffle=True)
+        test_loader = DataLoader(test_data, batch_size=8, shuffle=False)
+
+        model = GNN(input_dim=data_list[0].x.shape[1], hidden_dim=64, output_dim=len(class_mapping))
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        train_model(model, train_loader, optimizer, epochs=10, patience=patience)
+        results_before.append(evaluate_model_with_visualization(model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_before", stage=f"Fold {fold+1} Test (Before Tuning)"))
+
+        if param_grid:
+            best_params, best_model = grid_search(train_loader, test_loader, class_mapping, param_grid, patience)
+            results_after.append(evaluate_model_with_visualization(best_model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_after", stage=f"Fold {fold+1} Test (After Tuning)"))
+
+    return results_before, results_after
+
+
+# Directories and Mappings
+graph_dir = ""
+mask_dir = ""
+image_dir = ""
+classes = {
+    "augmented_normal": ("aug_normal/mask", "aug_normal/image"),
+    "augmented_cin1": ("aug_CIN1/mask", "aug_CIN1/image"),
+    "augmented_cin2": ("aug_CIN2/mask", "aug_CIN2/image"),
+    "cin3": ("aug_CIN3/mask", "aug_CIN3/image"),
+    "carcinoma": ("aug_Carcinoma/mask", "aug_Carcinoma/image")
+}
+graph_to_mask_image_maps = {
+    cls: generate_graph_to_mask_and_image_mapping(graph_dir, mask_dir, image_dir, cls, mask_cls, image_cls)
+    for cls, (mask_cls, image_cls) in classes.items()
+}
+class_mapping = {"augmented_normal": 0, "augmented_cin1": 1, "augmented_cin2": 2, "cin3": 3, "carcinoma": 4}
+# Inference Time Calculation for TPU, GPU, and CPU
+def measure_inference_time(model, test_loader, device, runs=100):
+    model.to(device)
+    model.eval()
+    start_time = time.time()
+    with torch.no_grad():
+        for _ in range(runs):
+            for data in test_loader:
+                data = data.to(device)
+                _ = model(data)
+    end_time = time.time()
+    avg_time = (end_time - start_time) / runs
+    print(f"Average inference time on {device}: {avg_time:.6f} seconds")
+    return avg_time
+
+# Time Complexity Analysis
+def analyze_time_complexity(model_type):
+    if model_type.lower() == "deeplabv3":
+        print("Complexity: O(N^2) due to convolutional processing.")
+    elif model_type.lower() == "gcn":
+        print("Complexity: O(V + E) due to node-edge aggregation.")
+    else:
+        print("Complexity analysis not available for this model.")
+
+# Real-Time Feasibility Check
+def check_real_time_feasibility(inference_times):
+    for device, time_taken in inference_times.items():
+        if time_taken < 0.1:  # 100 ms threshold
+            print(f"{device} meets real-time requirements.")
+        else:
+            print(f"{device} fails real-time requirements.")
+
+# Final Evaluation Metrics
+def compute_final_evaluation_metrics(y_true, y_pred, class_mapping):
+    report = classification_report(y_true, y_pred, target_names=list(class_mapping.keys()), zero_division=1)
+    auc_score = roc_auc_score(y_true, y_pred, multi_class='ovr')
+    print("Final Evaluation Metrics:")
+    print(report)
+    print(f"AUC Score: {auc_score:.4f}")
+    cm = confusion_matrix(y_true, y_pred)
+    ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=list(class_mapping.keys())).plot(cmap="Blues")
+    return report, auc_score
+
+# Load Data and Train Model
+param_grid = {"hidden_dim": [32, 64], "learning_rate": [0.001, 0.01], "epochs": [100, 100]}
+data_list = load_graphs(graph_dir, class_mapping, graph_to_mask_image_maps, max_graphs_per_class=500)
+results_before, results_after = train_gnn_kfold_with_visualization(data_list, class_mapping, k_folds=5, param_grid=param_grid)
+
+# Measure inference time across different devices
+devices = ["cpu"]
+if torch.cuda.is_available():
+    devices.append("cuda")
+if torch.backends.mps.is_available():  # Apple's Metal Performance Shaders (for macOS)
+    devices.append("mps")
+
+inference_times = {}
+for device in devices:
+    test_loader = DataLoader(data_list, batch_size=8, shuffle=False)
+    model = GNN(input_dim=data_list[0].x.shape[1], hidden_dim=64, output_dim=len(class_mapping))
+    inference_times[device] = measure_inference_time(model, test_loader, torch.device(device))
+
+# Time Complexity Analysis
+analyze_time_complexity("GCN")
+
+# Check Real-Time Feasibility
+check_real_time_feasibility(inference_times)
+
+# Compute Final Evaluation Metrics
+y_true, y_pred = [], []
+for data in test_loader:
+    with torch.no_grad():
+        out = model(data)
+        y_true.extend(data.y.cpu().numpy())
+        y_pred.extend(out.argmax(dim=1).cpu().numpy())
+compute_final_evaluation_metrics(y_true, y_pred, class_mapping)
+
+
+# Load Data and Train
+data_list = load_graphs(graph_dir, class_mapping, graph_to_mask_image_maps, max_graphs_per_class=500)
+param_grid = {"hidden_dim": [32, 64], "learning_rate": [0.001, 0.01], "epochs": [100, 100]}
+results_before, results_after = train_gnn_kfold_with_visualization(data_list, class_mapping, k_folds=5, param_grid=param_grid)
