@@ -1,0 +1,3 @@
+Author(s) : Priyadarshini Chatterjee
+Title : Multi-Modal Graph Neural Networks for Colposcopy Data Classification and Visualization
+Year :2025 
