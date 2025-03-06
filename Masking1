@@ -1,0 +1,74 @@
+import os
+import json
+from PIL import Image, ImageDraw
+import numpy as np
+import matplotlib.pyplot as plt
+
+def create_mask_from_json(json_path, image_size):
+    """Creates a binary mask from a JSON annotation file."""
+    with open(json_path, 'r') as f:
+        annotation = json.load(f)
+
+    # Create a blank mask
+    mask = Image.new('L', image_size, 0)  # 'L' for grayscale
+    draw = ImageDraw.Draw(mask)
+
+    # Iterate over shapes and draw polygons on the mask
+    for shape in annotation.get("shapes", []):
+        points = shape.get("points", [])
+        if points:
+            points = [(int(x), int(y)) for x, y in points]  # Convert points to integers
+
+            # Ensure points are within mask dimensions
+            if all(0 <= x < image_size[0] and 0 <= y < image_size[1] for x, y in points):
+                draw.polygon(points, outline=255, fill=255)  # Draw filled polygon
+            else:
+                print(f"Warning: Points out of bounds in {json_path}: {points}")
+
+    return mask
+
+def process_annotations(image_folder, json_folder, output_folder):
+    """Processes JSON annotation files and corresponding images to generate masks."""
+    # Create the output folder for masks
+    os.makedirs(output_folder, exist_ok=True)
+
+    for json_file in os.listdir(json_folder):
+        if json_file.endswith(".json"):
+            json_path = os.path.join(json_folder, json_file)
+            base_name = json_file.replace(".json", "")
+            image_path = os.path.join(image_folder, f"{base_name}.jpg")  # Adjust if image has a different extension
+
+            if os.path.exists(image_path):
+                image = Image.open(image_path)
+                image_size = image.size  # Get the image size
+
+                # Generate the mask from JSON
+                mask = create_mask_from_json(json_path, image_size)
+
+                # Save the mask image in the output folder
+                mask_filename = os.path.join(output_folder, f"{base_name}_mask.png")
+                mask.save(mask_filename)
+                print(f"Saved mask to: {mask_filename}")
+
+                # Show the original image and the mask side by side
+                plt.figure(figsize=(10, 5))
+                plt.subplot(1, 2, 1)
+                plt.imshow(image)
+                plt.axis('off')
+                plt.title(f"Original Image: {base_name}")
+
+                plt.subplot(1, 2, 2)
+                plt.imshow(mask, cmap='gray')
+                plt.axis('off')
+                plt.title(f"Mask: {base_name}")
+                plt.show()
+            else:
+                print(f"Warning: No corresponding image found for {json_path}")
+
+# Specify the directories
+image_folder = ''  # Update this path to the folder containing images
+json_folder = ''  # Update this path to the folder containing JSON files
+output_folder = ''  # Update this path to save the output masks
+
+# Run the processing function
+process_annotations(image_folder, json_folder, output_folder)
