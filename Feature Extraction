@@ -1,0 +1,143 @@
+import os
+from skimage.measure import regionprops
+from skimage.feature import graycomatrix, graycoprops
+from skimage import io
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.color import rgb2gray
+
+def extract_features_from_subfolder(subfolder_path, output_csv):
+    features = []
+    predicted_mask_path = os.path.join(subfolder_path, "predicted_mask.png")
+    original_image_path = os.path.join(subfolder_path, "original.png")
+
+    # Check if both predicted mask and original image exist
+    if not os.path.exists(predicted_mask_path) or not os.path.exists(original_image_path):
+        print(f"Missing files in {subfolder_path}. Skipping...")
+        return []
+
+    mask = io.imread(predicted_mask_path)
+    image = io.imread(original_image_path)
+
+    # Convert the original image to grayscale if it's RGB
+    if image.ndim == 3:  # RGB Image
+        image = rgb2gray(image)
+
+    # Normalize the grayscale image to ensure intensity values are between 0 and 1
+    image = image / np.max(image)
+
+    # Extract properties for each connected region in the mask
+    for region in regionprops(mask, intensity_image=image):
+        feature = {
+            "area": region.area,
+            "perimeter": region.perimeter,
+            "eccentricity": region.eccentricity,
+            "solidity": region.solidity,
+            "mean_intensity": region.mean_intensity,
+            "centroid_x": region.centroid[0],
+            "centroid_y": region.centroid[1],
+            "major_axis_length": region.major_axis_length,
+            "minor_axis_length": region.minor_axis_length,
+            "aspect_ratio": region.major_axis_length / (region.minor_axis_length + 1e-7),
+            "compactness": (4 * np.pi * region.area) / (region.perimeter**2 + 1e-7),
+            "circularity": (4 * np.pi * region.area) / ((region.perimeter**2) + 1e-7),
+        }
+
+        # Texture features using GLCM
+        glcm = graycomatrix((image * 255).astype(np.uint8), distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+        feature["contrast"] = graycoprops(glcm, "contrast")[0, 0]
+        feature["correlation"] = graycoprops(glcm, "correlation")[0, 0]
+        feature["energy"] = graycoprops(glcm, "energy")[0, 0]
+        feature["homogeneity"] = graycoprops(glcm, "homogeneity")[0, 0]
+
+        features.append(feature)
+
+    return features
+# Function to process all subfolders in a class directory
+def process_class_directory(class_dir, output_csv, visualization_dir):
+    features = []
+
+    for subfolder in os.listdir(class_dir):
+        subfolder_path = os.path.join(class_dir, subfolder)
+        if os.path.isdir(subfolder_path):
+            print(f"Processing subfolder: {subfolder_path}")
+            features += extract_features_from_subfolder(subfolder_path, output_csv)
+
+    if not features:
+        print(f"No features extracted for class directory: {class_dir}")
+        return
+
+    # Save features to CSV
+    df = pd.DataFrame(features)
+    df.to_csv(output_csv, index=False)
+    print(f"Features saved to {output_csv}")
+
+    # Generate visualizations
+    os.makedirs(visualization_dir, exist_ok=True)
+    visualize_feature_distributions(df, os.path.basename(class_dir), visualization_dir)
+
+def visualize_feature_distributions(df, class_name, output_dir):
+    # Selected features for visualization
+    selected_features = ["area", "perimeter", "eccentricity", "mean_intensity", "contrast", "circularity"]
+
+    # Global styling
+    plt.rcParams.update({
+        "font.size": 16,  # Increase font size for titles, labels, etc.
+        "axes.labelsize": 16,
+        "axes.titlesize": 18,
+        "xtick.labelsize": 14,
+        "ytick.labelsize": 14,
+        "legend.fontsize": 14,
+        "lines.linewidth": 2,  # Thicker lines for better visibility
+        "axes.titleweight": "bold",
+    })
+
+    # Create histograms for each feature
+    for feature in selected_features:
+        plt.figure(figsize=(10, 8))  # Larger figure size
+        plt.hist(df[feature], bins=30, color='darkblue', edgecolor='black', alpha=0.8)
+        plt.title(f"{feature.capitalize()} Distribution ({class_name})", fontweight='bold')
+        plt.xlabel(feature.capitalize())
+        plt.ylabel("Frequency")
+        plt.grid(axis='y', linestyle='--', alpha=0.7, linewidth=0.5)
+        plt.tight_layout()  # Ensure everything fits well
+        plt.savefig(os.path.join(output_dir, f"{class_name}_{feature}_distribution.png"), dpi=300)  # High-resolution output
+        plt.close()
+
+    # Boxplot comparison for morphological features
+    plt.figure(figsize=(12, 8))  # Larger figure size
+    df[selected_features[:4]].boxplot(patch_artist=True,
+                                      boxprops=dict(facecolor='lightblue', color='darkblue', linewidth=2),
+                                      medianprops=dict(color='red', linewidth=2),
+                                      whiskerprops=dict(color='darkblue', linewidth=2),
+                                      capprops=dict(color='darkblue', linewidth=2))
+    plt.title(f"Morphological Feature Comparison ({class_name})", fontweight='bold')
+    plt.ylabel("Value")
+    plt.xticks(rotation=45)
+    plt.grid(axis='y', linestyle='--', alpha=0.7, linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{class_name}_boxplot.png"), dpi=300)  # High-resolution output
+    plt.close()
+
+
+# Main function to process all classes
+def process_all_classes(base_dir, output_dir, visualization_dir):
+    classes = ["augmented_normal", "augmented_cin1", "augmented_cin2", "cin3", "carcinoma"]
+
+    for cls in classes:
+        print(f"Processing class: {cls}")
+
+        class_dir = os.path.join(base_dir, cls)
+        class_output_csv = os.path.join(output_dir, f"{cls}_features.csv")
+        class_visualization_dir = os.path.join(visualization_dir, cls)
+
+        process_class_directory(class_dir, class_output_csv, class_visualization_dir)
+
+# Directories
+base_dir =   # Replace with your base folder containing all classes
+output_dir =  # Directory to save features CSVs
+visualization_dir =  # Directory to save visualizations
+
+# Run the processing pipeline
+process_all_classes(base_dir, output_dir, visualization_dir)
