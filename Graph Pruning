@@ -1,0 +1,54 @@
+import networkx as nx
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+from sklearn.metrics.pairwise import euclidean_distances
+import numpy as np
+
+def construct_graph_with_pruning(features_csv, output_gml, visualization_dir, pruning_method="threshold", k=5, threshold=0.5):
+    # Load features from CSV
+    features = pd.read_csv(features_csv)
+
+    # Create a graph
+    G = nx.Graph()
+
+    # Add nodes with features as attributes
+    for i, row in features.iterrows():
+        G.add_node(i, **row.to_dict())
+
+    # Compute distance matrix
+    feature_matrix = features[["area", "perimeter", "eccentricity", "mean_intensity", "contrast"]].values
+    distances = euclidean_distances(feature_matrix)
+
+    if pruning_method == "threshold":
+        for i in range(len(features)):
+            for j in range(i + 1, len(features)):
+                if distances[i, j] <= threshold:
+                    G.add_edge(i, j, weight=1 / (distances[i, j] + 1e-7))
+
+    elif pruning_method == "knn":
+        for i in range(len(features)):
+            nearest_indices = np.argsort(distances[i])[:k+1]  # Get k-nearest neighbors (excluding itself)
+            for j in nearest_indices:
+                if i != j:  # Avoid self-loops
+                    G.add_edge(i, j, weight=1 / (distances[i, j] + 1e-7))
+
+    elif pruning_method == "top_k":
+        for i in range(len(features)):
+            sorted_indices = np.argsort(distances[i])[:k]  # Select top-K closest edges
+            for j in sorted_indices:
+                if i != j:
+                    G.add_edge(i, j, weight=1 / (distances[i, j] + 1e-7))
+
+    # Save graph to GML file
+    nx.write_gml(G, output_gml)
+    print(f"Graph saved to {output_gml}")
+
+    # Visualize and save the graph
+    os.makedirs(visualization_dir, exist_ok=True)
+    plt.figure(figsize=(10, 10))
+    pos = nx.spring_layout(G)
+    nx.draw(G, pos, with_labels=False, node_size=20, node_color='blue', edge_color='gray')
+    plt.title(f"Graph Visualization ({pruning_method})")
+    plt.savefig(os.path.join(visualization_dir, f"graph_{pruning_method}_visualization.png"), dpi=300)
+    plt.close()
