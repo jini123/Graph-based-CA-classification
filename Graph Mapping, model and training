@@ -12,7 +12,7 @@ import numpy as np
 import networkx as nx
 from sklearn.model_selection import ParameterGrid, KFold
 from torch_geometric.utils import to_networkx
-
+from ptflops import get_model_complexity_info
 # GNN Model Definition
 class GNN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -197,6 +197,8 @@ def grid_search(train_loader, val_loader, class_mapping, param_grid, patience):
 
 
 # K-Fold Cross-Validation
+from ptflops import get_model_complexity_info  # Make sure ptflops is installed
+
 def train_gnn_kfold_with_visualization(data_list, class_mapping, k_folds=5, param_grid=None, patience=5):
     results_before, results_after = [], []
     kf = KFold(n_splits=k_folds, shuffle=True)
@@ -208,14 +210,32 @@ def train_gnn_kfold_with_visualization(data_list, class_mapping, k_folds=5, para
 
         model = GNN(input_dim=data_list[0].x.shape[1], hidden_dim=64, output_dim=len(class_mapping))
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        # --- FLOPs calculation ---
+        try:
+            with torch.cuda.device(0):
+                macs, params = get_model_complexity_info(
+                    model, (data_list[0].x.shape[1],),
+                    as_strings=True, print_per_layer_stat=True, verbose=True
+                )
+            print(f'Fold {fold+1}: FLOPs (MACs * 2) for GNN model: {macs}, Params: {params}')
+        except Exception as e:
+            print(f"FLOPs calculation failed for fold {fold+1}: {e}")
+        # ------------------------------------------------
+
         train_model(model, train_loader, optimizer, epochs=10, patience=patience)
-        results_before.append(evaluate_model_with_visualization(model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_before", stage=f"Fold {fold+1} Test (Before Tuning)"))
+        results_before.append(
+            evaluate_model_with_visualization(model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_before", stage=f"Fold {fold+1} Test (Before Tuning)")
+        )
 
         if param_grid:
             best_params, best_model = grid_search(train_loader, test_loader, class_mapping, param_grid, patience)
-            results_after.append(evaluate_model_with_visualization(best_model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_after", stage=f"Fold {fold+1} Test (After Tuning)"))
+            results_after.append(
+                evaluate_model_with_visualization(best_model, test_loader, class_mapping, save_dir=f"fold_{fold+1}_after", stage=f"Fold {fold+1} Test (After Tuning)")
+            )
 
     return results_before, results_after
+
 
 
 # Directories and Mappings
